@@ -1,8 +1,14 @@
-import feedparser
-import requests
-from bs4 import BeautifulSoup
-import re
+import asyncio
+import aiohttp
 from newspaper import Article, Config
+import feedparser
+import re
+from datetime import datetime, timedelta
+import hashlib
+
+# Cache đơn giản lưu trữ 1 giờ
+NEWS_CACHE = {}
+CACHE_EXPIRY = timedelta(hours=1)
 
 def fetch_full_content(url):
     """Lấy toàn bộ nội dung bài viết từ URL sử dụng newspaper3k"""
@@ -25,47 +31,57 @@ def split_into_chunks(text, chunk_size=500):
     if not text:
         return []
     
-    # Chuẩn hóa khoảng trắng
     clean_text = re.sub(r'\s+', ' ', text).strip()
-    chunks = []
+    sentences = re.split(r'(?<=[.!?]) +', clean_text)
     
-    start = 0
-    while start < len(clean_text):
-        end = start + chunk_size
-        if end >= len(clean_text):
-            chunks.append(clean_text[start:])
-            break
-        
-        # Tìm vị trí cắt tự nhiên (dấu câu hoặc khoảng trắng)
-        while end > start and clean_text[end] not in (' ', '.', '!', '?', ','):
-            end -= 1
-        
-        if end == start:  # Trường hợp không tìm thấy vị trí cắt
-            end = start + chunk_size
-            
-        chunks.append(clean_text[start:end].strip())
-        start = end + 1
+    chunks = []
+    current_chunk = ""
+    
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) <= chunk_size:
+            current_chunk += sentence + " "
+        else:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = sentence + " "
+    
+    if current_chunk:
+        chunks.append(current_chunk.strip())
         
     return chunks
 
-def get_news_from_rss(rss_url):
-    """Lấy tin tức từ RSS feed và xử lý nội dung"""
-    news_items = []
-    feed = feedparser.parse(rss_url)
+async def async_fetch_feed(session, rss_url):
+    """Lấy nội dung RSS feed bất đồng bộ"""
+    cache_key = hashlib.md5(rss_url.encode()).hexdigest()
     
-    for entry in feed.entries[:5]:  # Giới hạn 5 bài mỗi nguồn
-        try:
-            full_content = fetch_full_content(entry.link)
-            chunks = split_into_chunks(full_content)
+    # Kiểm tra cache
+    if cache_key in NEWS_CACHE:
+        cached_time, data = NEWS_CACHE[cache_key]
+        if datetime.now() - cached_time < CACHE_EXPIRY:
+            return data
+    
+    try:
+        async with session.get(rss_url) as response:
+            content = await response.text()
+            feed = feedparser.parse(content)
             
-            news_items.append({
-                "title": entry.title,
-                "link": entry.link,
-                "published": entry.get("published", ""),
-                "source": rss_url,
-                "chunks": chunks
-            })
-        except Exception as e:
-            print(f"Error processing {entry.link}: {e}")
-    
-    return news_items
+            news_items = []
+            for entry in feed.entries[:5]:
+                full_content = fetch_full_content(entry.link)
+                chunks = split_into_chunks(full_content)
+                
+                news_items.append({
+                    "title": entry.title,
+                    "link": entry.link,
+                    "published": entry.get("published", ""),
+                    "source": rss_url,
+                    "chunks": chunks
+                })
+            
+            # Lưu vào cache
+            NEWS_CACHE[cache_key] = (datetime.now(), news_items)
+            return news_items
+            
+    except Exception as e:
+        print(f"Error fetching {rss_url}: {e}")
+        return []
