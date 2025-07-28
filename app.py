@@ -1,5 +1,7 @@
 from flask import Flask, jsonify
-from news_fetcher import get_news_from_rss
+import asyncio
+import aiohttp
+from news_fetcher import async_fetch_feed
 
 app = Flask(__name__)
 
@@ -11,19 +13,26 @@ RSS_FEEDS = [
     "https://vietstock.vn/1328/dong-duong/thi-truong-chung-khoan.rss"
 ]
 
+async def fetch_all_news():
+    async with aiohttp.ClientSession() as session:
+        tasks = [async_fetch_feed(session, url) for url in RSS_FEEDS]
+        results = await asyncio.gather(*tasks)
+        
+        all_news = []
+        for news in results:
+            all_news.extend(news)
+        return all_news
+
 @app.route('/news', methods=['GET'])
 def get_news():
-    all_news = []
-    for rss_url in RSS_FEEDS:
-        try:
-            news = get_news_from_rss(rss_url)
-            all_news.extend(news)
-        except Exception as e:
-            print(f"Error processing {rss_url}: {e}")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    news = loop.run_until_complete(fetch_all_news())
+    loop.close()
     
     return jsonify({
-        "total_articles": len(all_news),
-        "results": all_news
+        "total_articles": len(news),
+        "results": news
     })
 
 if __name__ == '__main__':
