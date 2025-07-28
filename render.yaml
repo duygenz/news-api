@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: news-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    env: python
+    port: 5000
