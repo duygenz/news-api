@@ -1,102 +1,102 @@
-# app.py
-
-import feedparser
-import requests
-from bs4 import BeautifulSoup
 from flask import Flask, jsonify
-from concurrent.futures import ThreadPoolExecutor
+from flask_cors import CORS
+import feedparser
+import threading
+from time import time
 
-# Khởi tạo ứng dụng Flask
-app = Flask(__name__)
-
-# Danh sách các nguồn RSS
+# --- Configuration ---
 RSS_FEEDS = [
-    "https://vietstock.vn/830/chung-khoan/co-phieu.rss",
-    "https://cafef.vn/thi-truong-chung-khoan.rss",
-    "https://vietstock.vn/145/chung-khoan/y-kien-chuyen-gia.rss",
-    "https://vietstock.vn/737/doanh-nghiep/hoat-dong-kinh-doanh.rss",
-    "https://vietstock.vn/1328/dong-duong/thi-truong-chung-khoan.rss",
+    'https://cafef.vn/thi-truong-chung-khoan.rss',
+    'https://vneconomy.vn/chung-khoan.rss',
+    'https://vneconomy.vn/tai-chinh.rss',
+    'https://vneconomy.vn/thi-truong.rss',
+    'https://vneconomy.vn/nhip-cau-doanh-nghiep.rss',
+    'https://vneconomy.vn/tin-moi.rss',
+    'https://cafebiz.vn/rss/cau-chuyen-kinh-doanh.rss'
 ]
 
-# Hàm để lấy nội dung đầy đủ của bài viết
-def get_full_article(url):
-    """
-    Truy cập URL của bài viết và trích xuất toàn bộ nội dung.
-    Hàm này cần được tùy chỉnh cho từng trang web khác nhau.
-    """
+# --- Flask App Initialization ---
+app = Flask(__name__)
+# This enables CORS for all domains on all routes.
+CORS(app)
+
+# --- In-Memory Caching ---
+# A simple cache to store the news and avoid re-fetching on every request.
+news_cache = {
+    "articles": [],
+    "last_updated": 0
+}
+CACHE_DURATION_SECONDS = 600  # Cache news for 10 minutes
+
+# --- Core Logic ---
+def fetch_single_feed(url, articles_list):
+    """Fetches entries from a single RSS feed and appends them to a list."""
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()  # Ném lỗi nếu request không thành công
-        soup = BeautifulSoup(response.content, "html.parser")
-
-        # Logic cho Vietstock
-        if "vietstock.vn" in url:
-            # Vietstock dùng div có id 'vst-content' cho nội dung chính
-            content_div = soup.find("div", {"id": "vst-content"})
-            if content_div:
-                return content_div.get_text(separator="\n", strip=True)
-
-        # Logic cho Cafef
-        elif "cafef.vn" in url:
-            # Cafef dùng div có id 'main-content'
-            content_div = soup.find("div", {"class": "content-detail"})
-            if content_div:
-                return content_div.get_text(separator="\n", strip=True)
-
-        return "Không thể lấy được nội dung."
-
-    except requests.RequestException as e:
-        print(f"Lỗi khi truy cập {url}: {e}")
-        return "Lỗi khi truy cập URL."
+        feed = feedparser.parse(url)
+        source_name = feed.feed.get('title', 'Unknown Source')
+        for entry in feed.entries:
+            articles_list.append({
+                'source': source_name,
+                'title': entry.get('title', 'No Title'),
+                'link': entry.get('link', '#'),
+                'published': entry.get('published', 'No Date'),
+                'summary': entry.get('summary', 'No Summary')
+            })
     except Exception as e:
-        print(f"Lỗi không xác định với {url}: {e}")
-        return "Lỗi không xác định."
+        print(f"Error fetching feed {url}: {e}")
 
-# Hàm để xử lý một RSS feed
-def process_feed(feed_url):
+def update_news_cache():
     """
-    Phân tích một RSS feed và lấy thông tin các bài viết.
+    Fetches all RSS feeds concurrently using threads and updates the cache.
     """
-    news_list = []
-    feed = feedparser.parse(feed_url)
-    for entry in feed.entries:
-        news_list.append(
-            {
-                "title": entry.title,
-                "link": entry.link,
-                "published": entry.get("published", "N/A"),
-                "summary": entry.summary,
-            }
-        )
-    return news_list
+    global news_cache
+    print("Updating news cache...")
+    articles = []
+    threads = []
 
-# API endpoint chính
-@app.route("/news")
-def get_news_in_chunks():
+    for url in RSS_FEEDS:
+        thread = threading.Thread(target=fetch_single_feed, args=(url, articles))
+        threads.append(thread)
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+    
+    # Sort articles by published date (best effort)
+    # Note: Date formats can be inconsistent across feeds.
+    try:
+        articles.sort(key=lambda x: feedparser._parse_date(x['published']), reverse=True)
+    except Exception:
+        # If dates can't be parsed, just leave the order as is.
+        pass
+
+    news_cache['articles'] = articles
+    news_cache['last_updated'] = time()
+    print(f"Cache updated with {len(articles)} articles.")
+
+
+# --- API Endpoint ---
+@app.route('/news', methods=['GET'])
+def get_news():
     """
-    Lấy tin tức từ tất cả các nguồn RSS và trả về dưới dạng JSON.
-    Sử dụng multi-threading để tăng tốc độ lấy tin.
+    The main API endpoint. It returns cached news or triggers a fetch if the
+    cache is stale.
     """
-    all_articles_metadata = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        # Lấy danh sách các bài viết từ tất cả các feed
-        results = executor.map(process_feed, RSS_FEEDS)
-        for news_list in results:
-            all_articles_metadata.extend(news_list)
+    is_cache_stale = (time() - news_cache['last_updated']) > CACHE_DURATION_SECONDS
+    if not news_cache['articles'] or is_cache_stale:
+        update_news_cache()
+    
+    return jsonify(news_cache['articles'])
 
-    # Lấy nội dung đầy đủ cho từng bài viết
-    def fetch_full_content(article):
-        article["full_content"] = get_full_article(article["link"])
-        return article
+@app.route('/', methods=['GET'])
+def index():
+    """A simple welcome message for the root URL."""
+    return "<h1>News Aggregator API</h1><p>Use the <code>/news</code> endpoint to get the latest articles.</p>"
 
-    # Sử dụng multi-threading để lấy nội dung đầy đủ
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        # Giới hạn số lượng bài viết để tránh quá tải
-        full_articles = list(executor.map(fetch_full_content, all_articles_metadata[:20]))
+# This is necessary for Render's deployment environment.
+if __name__ == '__main__':
+    # Initial data fetch on startup
+    update_news_cache()
+    # The app is run by Gunicorn in production, not this command.
+    app.run(host='0.0.0.0', port=5001)
 
-    return jsonify(full_articles)
-
-# Chạy ứng dụng
-if __name__ == "__main__":
-    # Chạy trên cổng 8080 hoặc cổng do Render cung cấp
-    app.run(host="0.0.0.0", port=8080)
