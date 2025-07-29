@@ -1,102 +1,157 @@
-from flask import Flask, jsonify
-from flask_cors import CORS
+import asyncio
+import re
+from typing import List, Dict, Any
+import requests
+from bs4 import BeautifulSoup
 import feedparser
-import threading
-from time import time
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-# --- Configuration ---
+# Khởi tạo ứng dụng FastAPI
+app = FastAPI(
+    title="Vietnamese News API",
+    description="API tổng hợp, trích xuất và chia nhỏ nội dung tin tức từ các trang báo Việt Nam.",
+    version="1.0.0"
+)
+
+# Cấu hình CORS (Cross-Origin Resource Sharing)
+# Cho phép tất cả các nguồn gốc (origins) truy cập API.
+# Trong môi trường production, bạn nên giới hạn lại chỉ những domain được phép.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Cho phép tất cả
+    allow_credentials=True,
+    allow_methods=["*"],  # Cho phép tất cả các phương thức (GET, POST, etc.)
+    allow_headers=["*"],  # Cho phép tất cả các headers
+)
+
+# Danh sách các nguồn RSS feed
 RSS_FEEDS = [
-    'https://cafef.vn/thi-truong-chung-khoan.rss',
-    'https://vneconomy.vn/chung-khoan.rss',
-    'https://vneconomy.vn/tai-chinh.rss',
-    'https://vneconomy.vn/thi-truong.rss',
-    'https://vneconomy.vn/nhip-cau-doanh-nghiep.rss',
-    'https://vneconomy.vn/tin-moi.rss',
-    'https://cafebiz.vn/rss/cau-chuyen-kinh-doanh.rss'
+    "https://cafef.vn/thi-truong-chung-khoan.rss",
+    "https://vneconomy.vn/chung-khoan.rss",
+    "https://vneconomy.vn/tai-chinh.rss",
+    "https://vneconomy.vn/thi-truong.rss",
+    "https://vneconomy.vn/nhip-cau-doanh-nghiep.rss",
+    "https://vneconomy.vn/tin-moi.rss",
+    "https://cafebiz.vn/rss/cau-chuyen-kinh-doanh.rss"
 ]
 
-# --- Flask App Initialization ---
-app = Flask(__name__)
-# This enables CORS for all domains on all routes.
-CORS(app)
+# --- Helper Functions ---
 
-# --- In-Memory Caching ---
-# A simple cache to store the news and avoid re-fetching on every request.
-news_cache = {
-    "articles": [],
-    "last_updated": 0
-}
-CACHE_DURATION_SECONDS = 600  # Cache news for 10 minutes
-
-# --- Core Logic ---
-def fetch_single_feed(url, articles_list):
-    """Fetches entries from a single RSS feed and appends them to a list."""
+def get_full_content_from_url(url: str) -> str:
+    """
+    Truy cập một URL bài báo và trích xuất nội dung văn bản đầy đủ.
+    Lưu ý: Cấu trúc selector có thể cần được cập nhật nếu trang web thay đổi layout.
+    """
     try:
-        feed = feedparser.parse(url)
-        source_name = feed.feed.get('title', 'Unknown Source')
-        for entry in feed.entries:
-            articles_list.append({
-                'source': source_name,
-                'title': entry.get('title', 'No Title'),
-                'link': entry.get('link', '#'),
-                'published': entry.get('published', 'No Date'),
-                'summary': entry.get('summary', 'No Summary')
-            })
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # Logic để tìm nội dung chính dựa trên cấu trúc HTML của từng trang
+        content = ""
+        if "vneconomy.vn" in url:
+            article_body = soup.find("div", class_="detail__content")
+            if article_body:
+                content = article_body.get_text(separator="\n", strip=True)
+        elif "cafef.vn" in url or "cafebiz.vn" in url:
+            article_body = soup.find("div", id="mainContent")
+            if article_body:
+                content = article_body.get_text(separator="\n", strip=True)
+        else:
+            # Một selector chung chung hơn nếu không khớp
+            article_body = soup.find("article") or soup.find("div", class_="content")
+            if article_body:
+                content = article_body.get_text(separator="\n", strip=True)
+
+        # Dọn dẹp văn bản
+        content = re.sub(r'\s*\n\s*', '\n', content).strip()
+        return content
+
+    except requests.RequestException as e:
+        print(f"Lỗi khi lấy nội dung từ {url}: {e}")
+        return ""
     except Exception as e:
-        print(f"Error fetching feed {url}: {e}")
+        print(f"Lỗi không xác định khi xử lý {url}: {e}")
+        return ""
 
-def update_news_cache():
+
+def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> List[str]:
     """
-    Fetches all RSS feeds concurrently using threads and updates the cache.
+    Chia một đoạn văn bản dài thành các đoạn nhỏ hơn (chunks) có kích thước xấp xỉ `chunk_size`
+    và có sự chồng lấp (overlap) giữa các chunk.
     """
-    global news_cache
-    print("Updating news cache...")
+    if not text:
+        return []
+    
+    # Chia văn bản thành các câu để tránh cắt giữa câu
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    
+    chunks = []
+    current_chunk = ""
+    
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) + 1 > chunk_size:
+            chunks.append(current_chunk.strip())
+            # Bắt đầu chunk mới với một phần overlap từ chunk cũ
+            start_index = max(0, len(current_chunk) - overlap)
+            current_chunk = current_chunk[start_index:] + " " + sentence
+        else:
+            current_chunk += " " + sentence
+            
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+        
+    return chunks
+
+
+async def fetch_and_process_feed(feed_url: str) -> List[Dict[str, Any]]:
+    """
+    Lấy tin từ một RSS feed, trích xuất nội dung đầy đủ và chia nhỏ nội dung.
+    Đây là một hàm bất đồng bộ (async).
+    """
+    print(f"Đang xử lý feed: {feed_url}")
+    parsed_feed = feedparser.parse(feed_url)
     articles = []
-    threads = []
 
-    for url in RSS_FEEDS:
-        thread = threading.Thread(target=fetch_single_feed, args=(url, articles))
-        threads.append(thread)
-        thread.start()
+    for entry in parsed_feed.entries:
+        full_content = get_full_content_from_url(entry.link)
+        if full_content:
+            content_chunks = chunk_text(full_content)
+            
+            articles.append({
+                "source": parsed_feed.feed.get("title", "Không rõ nguồn"),
+                "title": entry.title,
+                "link": entry.link,
+                "published": entry.get("published", "Không rõ ngày"),
+                "summary": entry.get("summary", ""),
+                "full_content_chunks": content_chunks
+            })
+    return articles
 
-    for thread in threads:
-        thread.join()
-    
-    # Sort articles by published date (best effort)
-    # Note: Date formats can be inconsistent across feeds.
-    try:
-        articles.sort(key=lambda x: feedparser._parse_date(x['published']), reverse=True)
-    except Exception:
-        # If dates can't be parsed, just leave the order as is.
-        pass
+# --- API Endpoints ---
 
-    news_cache['articles'] = articles
-    news_cache['last_updated'] = time()
-    print(f"Cache updated with {len(articles)} articles.")
+@app.get("/", include_in_schema=False)
+def read_root():
+    return {"message": "Chào mừng đến với API Tin tức Việt Nam. Truy cập /docs để xem tài liệu API."}
 
 
-# --- API Endpoint ---
-@app.route('/news', methods=['GET'])
-def get_news():
+@app.get("/api/news", summary="Lấy tin tức hàng loạt từ tất cả các nguồn")
+async def get_all_news():
     """
-    The main API endpoint. It returns cached news or triggers a fetch if the
-    cache is stale.
+    Tổng hợp tin tức từ tất cả các RSS feed đã được định cấu hình.
+
+    - **Lấy đồng thời**: API sẽ gọi đến tất cả các nguồn RSS cùng một lúc để tăng tốc độ.
+    - **Lấy nội dung đầy đủ**: Hệ thống sẽ tự động truy cập link của từng bài báo để lấy toàn bộ nội dung.
+    - **Tạo chunks**: Nội dung đầy đủ sẽ được chia thành các đoạn nhỏ hơn (chunks) để dễ dàng xử lý.
     """
-    is_cache_stale = (time() - news_cache['last_updated']) > CACHE_DURATION_SECONDS
-    if not news_cache['articles'] or is_cache_stale:
-        update_news_cache()
+    # Sử dụng asyncio.gather để chạy tất cả các tác vụ lấy feed đồng thời
+    tasks = [fetch_and_process_feed(url) for url in RSS_FEEDS]
+    results = await asyncio.gather(*tasks)
     
-    return jsonify(news_cache['articles'])
+    # Làm phẳng danh sách kết quả (vì mỗi tác vụ trả về một danh sách)
+    all_articles = [article for feed_result in results for article in feed_result]
+    
+    return {"count": len(all_articles), "articles": all_articles}
 
-@app.route('/', methods=['GET'])
-def index():
-    """A simple welcome message for the root URL."""
-    return "<h1>News Aggregator API</h1><p>Use the <code>/news</code> endpoint to get the latest articles.</p>"
-
-# This is necessary for Render's deployment environment.
-if __name__ == '__main__':
-    # Initial data fetch on startup
-    update_news_cache()
-    # The app is run by Gunicorn in production, not this command.
-    app.run(host='0.0.0.0', port=5001)
-
+# Lệnh để chạy local: uvicorn main:app --reload
